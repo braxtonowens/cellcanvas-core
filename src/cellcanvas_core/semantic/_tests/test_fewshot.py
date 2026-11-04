@@ -30,6 +30,7 @@ def test_fit_predict_shapes():
     assert proba.shape == (7, 3)
     np.testing.assert_allclose(proba.sum(axis=1), 1, rtol=1e-5)
     assert model.predict(X[:7]).shape == (7,)
+    np.testing.assert_array_equal(model.predict(X[:7].tolist()), model.predict(X[:7]))
 
 
 def test_column_labels_are_flattened():
@@ -82,12 +83,18 @@ def test_invalid_inputs_raise():
     X, y = blobs(5)
     with pytest.raises(ValueError, match="integers"):
         FewShotClassifier().fit(X, y.astype(float))
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError, match="inconsistent"):
         FewShotClassifier().fit(X, y[:-1])
-    with pytest.raises(ValueError, match="finite"):
+    with pytest.raises(ValueError, match="NaN"):
         FewShotClassifier().fit(np.full_like(X, np.nan), y)
-    with pytest.raises(ValueError, match="knn_weight"):
-        FewShotClassifier(knn_weight=2.0).fit(X, y)
+    for param in (
+        {"knn_weight": 2.0},
+        {"dropout": 1.0},
+        {"n_neighbors": 0},
+        {"max_bank_size": 0},
+    ):
+        with pytest.raises(ValueError, match=next(iter(param))):
+            FewShotClassifier(**param).fit(X, y)
     model = FewShotClassifier(**FAST).fit(X, y)
     with pytest.raises(ValueError, match="shape"):
         model.predict(X[:, :3])
@@ -105,13 +112,48 @@ def test_predict_before_fit_raises():
         FewShotClassifier().predict(np.zeros((2, 3)))
 
 
-def test_bank_cap_and_single_predictors():
+def test_bank_cap_keeps_small_classes():
     X, y = blobs(100)
-    model = FewShotClassifier(max_bank_size=50, **FAST).fit(X, y)
-    assert len(model.bank_[0]) == 50
+    keep = np.concatenate([np.arange(200), np.arange(200, 205)])  # 100, 100, 5
+    for seed in range(5):
+        model = FewShotClassifier(max_bank_size=50, random_state=seed, **FAST)
+        bank_y = model.fit(X[keep], y[keep]).bank_[1]
+        np.testing.assert_array_equal(np.bincount(bank_y), [22, 23, 5])
+
+
+def test_single_predictors():
+    X, y = blobs(100)
+    model = FewShotClassifier(**FAST)
     for weight in (0.0, 1.0):
         single = clone(model).set_params(knn_weight=weight).fit(X, y)
+        assert (single.mlp_ is None) == (weight == 1.0)
+        assert (single.bank_ is None) == (weight == 0.0)
         assert np.mean(single.predict(X) == y) > 0.95
+
+
+def test_knn_margin_limits_the_vote():
+    X, y = blobs(30)
+    model = FewShotClassifier(**FAST).fit(X, y)
+    X = np.random.default_rng(4).normal(size=(300, 16)).astype(np.float32) * 3
+    everywhere = model.predict_proba(X)
+    mlp = model.set_params(knn_margin=0.0).predict_proba(X)
+    np.testing.assert_allclose(mlp, model._mlp_proba(X), rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(
+        model.set_params(knn_margin=1.1).predict_proba(X), everywhere
+    )
+    some = model.set_params(knn_margin=0.5).predict_proba(X)
+    voted = ~np.all(np.isclose(some, mlp), axis=1)
+    assert 0 < voted.sum() < len(X)
+    np.testing.assert_allclose(some[voted], everywhere[voted], rtol=1e-5, atol=1e-6)
+
+
+def test_predict_matches_predict_proba():
+    X, y = blobs(30, spread=3.0)
+    model = FewShotClassifier(**FAST).fit(X, y + 1)
+    proba = model.predict_proba(X)
+    np.testing.assert_array_equal(
+        model.predict(X), model.classes_[proba.argmax(axis=1)]
+    )
 
 
 def test_random_state_makes_fits_repeatable():
@@ -119,6 +161,8 @@ def test_random_state_makes_fits_repeatable():
     a = FewShotClassifier(**FAST).fit(X, y).predict_proba(X)
     b = FewShotClassifier(**FAST).fit(X, y).predict_proba(X)
     np.testing.assert_array_equal(a, b)
+    legacy = FewShotClassifier(random_state=np.random.RandomState(0), **FAST)
+    assert np.mean(legacy.fit(X, y).predict(X) == y) > 0.95
 
 
 def test_segmentation_manager_end_to_end():
