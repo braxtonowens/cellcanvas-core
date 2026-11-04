@@ -17,7 +17,7 @@ class SpatialTransform:
     units: tuple[str | None, str | None, str | None] = (None, None, None)
 
 
-def spatial_transform(metadata, level=0):
+def spatial_transform(metadata, level=0, axes=("c", "z", "y", "x")):
     """Compose level transforms followed by multiscale transforms.
 
     Supports inline scale and translation vectors from NGFF 0.4/0.5.
@@ -30,14 +30,16 @@ def spatial_transform(metadata, level=0):
     if not isinstance(multiscales, list) or len(multiscales) != 1:
         raise ValueError("Select a group with exactly one multiscale image")
     multiscale = multiscales[0]
-    axes = multiscale.get("axes", [])
-    if [axis.get("name") for axis in axes] != ["c", "z", "y", "x"]:
-        raise ValueError("Spatial coordinates require CZYX image axes")
+    declared_axes = multiscale.get("axes", [])
+    if axes not in (("c", "z", "y", "x"), ("z", "y", "x")):
+        raise ValueError("Spatial coordinates require CZYX or ZYX axes")
+    if [axis.get("name") for axis in declared_axes] != list(axes):
+        raise ValueError("Spatial coordinates must match the declared axes")
     datasets = multiscale.get("datasets", [])
     if not isinstance(level, int) or isinstance(level, bool) or not 0 <= level < len(datasets):
         raise ValueError("image_level is not listed in NGFF datasets")
-    scale = np.ones(4)
-    translation = np.zeros(4)
+    scale = np.ones(len(axes))
+    translation = np.zeros(len(axes))
     transform_lists = [datasets[level].get("coordinateTransformations")]
     if "coordinateTransformations" in multiscale:
         transform_lists.append(multiscale["coordinateTransformations"])
@@ -54,8 +56,8 @@ def spatial_transform(metadata, level=0):
                 vector = np.asarray(transform[kind], dtype=float)
             except (KeyError, TypeError, ValueError):
                 raise ValueError("NGFF transforms require inline numeric vectors") from None
-            if vector.shape != (4,) or not np.all(np.isfinite(vector)):
-                raise ValueError("NGFF transform vectors need four finite CZYX values")
+            if vector.shape != (len(axes),) or not np.all(np.isfinite(vector)):
+                raise ValueError("NGFF transform vectors must match the axes and contain finite values")
             if kind == "scale":
                 if np.any(vector <= 0):
                     raise ValueError("NGFF scale values must be positive")
@@ -63,5 +65,20 @@ def spatial_transform(metadata, level=0):
                 translation *= vector
             else:
                 translation += vector
-    units = tuple(axis.get("unit") for axis in axes[1:])
-    return SpatialTransform(tuple(scale[1:]), tuple(translation[1:]), units)
+    units = tuple(axis.get("unit") for axis in declared_axes[-3:])
+    return SpatialTransform(tuple(scale[-3:]), tuple(translation[-3:]), units)
+
+
+def validate_alignment(metadata, level, expected):
+    """Require annotation coordinates to agree within a billionth of a voxel.
+
+    Units must match exactly; no implicit unit conversion is performed.
+    """
+    actual = spatial_transform(metadata, level, axes=("z", "y", "x"))
+    if actual.units != expected.units:
+        raise ValueError("Annotation spatial units do not match the image")
+    if not np.allclose(actual.scale, expected.scale, rtol=1e-9, atol=0):
+        raise ValueError("Annotation spatial scale does not match the image")
+    if np.any(np.abs(np.asarray(actual.translation) - expected.translation) >
+              np.asarray(expected.scale) * 1e-9):
+        raise ValueError("Annotation spatial origin does not match the image")

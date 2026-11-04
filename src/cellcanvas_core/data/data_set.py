@@ -6,26 +6,41 @@ import zarr
 from zarr import Array
 
 from cellcanvas_core.data._image import open_image
-from cellcanvas_core.data._geometry import SpatialTransform, spatial_transform
+from cellcanvas_core.data._geometry import SpatialTransform, spatial_transform, validate_alignment
 
 
-def _open_annotations(path, shape, create, level):
+def _open_annotations(path, shape, create, level, expected, grouped=False):
     try:
         node = zarr.open(path, mode="r+")
     except FileNotFoundError:
         if not create:
             raise
-        return zarr.open_array(path, mode="a", shape=shape, dtype="i4", zarr_format=3)
+        if grouped:
+            node = zarr.open_group(path, mode="a", zarr_format=3)
+        else:
+            return zarr.open_array(path, mode="a", shape=shape, dtype="i4", zarr_format=3,
+                                   dimension_names=("z", "y", "x"))
     if isinstance(node, zarr.Group):
-        node, _ = open_image(path, level=level, axes=("z", "y", "x"), mode="r+")
+        metadata = node.attrs.asdict()
+        if "ome" in metadata or "multiscales" in metadata:
+            node, metadata = open_image(path, level=level, axes=("z", "y", "x"), mode="r+")
+            validate_alignment(metadata, level, expected)
+        elif grouped:
+            if "labels" in node:
+                node = node["labels"]
+            elif create:
+                options = {"dimension_names": ("z", "y", "x")} if node.metadata.zarr_format == 3 else {}
+                node = node.create_array("labels", shape=shape, dtype="i4", **options)
+            else:
+                raise ValueError("Annotation group has no labels array")
+        else:
+            node, _ = open_image(path, level=0, axes=("z", "y", "x"), mode="r+")
+    if not isinstance(node, zarr.Array) or node.shape != shape:
+        raise ValueError("Annotation spatial shape does not match the image")
+    names = getattr(node.metadata, "dimension_names", None)
+    if names is not None and names != ("z", "y", "x"):
+        raise ValueError("Annotation dimension_names must be ordered z, y, x")
     return node
-
-
-def _annotation_group(store):
-    try:
-        return zarr.open_group(store, mode="r+")
-    except FileNotFoundError:
-        return zarr.open_group(store, mode="a", zarr_format=3)
 
 @dataclass
 class DataSet:
@@ -102,6 +117,7 @@ class DataSet:
         """
         # get the image
         image, image_metadata = open_image(image_path, level=image_level)
+        geometry = spatial_transform(image_metadata, image_level)
 
         # get the features
         if isinstance(features_path, str):
@@ -110,12 +126,12 @@ class DataSet:
 
         # get the labels
         labels = _open_annotations(
-            labels_path, image.shape[1:], make_missing_datasets, image_level
+            labels_path, image.shape[1:], make_missing_datasets, image_level, geometry
         )
 
         # get the segmentation
         segmentation = _open_annotations(
-            segmentation_path, image.shape[1:], make_missing_datasets, image_level
+            segmentation_path, image.shape[1:], make_missing_datasets, image_level, geometry
         )
 
         return cls(
@@ -146,29 +162,18 @@ class DataSet:
         
         # get the image
         image, image_metadata = open_image(image_store, level=image_level)
+        geometry = spatial_transform(image_metadata, image_level)
 
         # get the features
         features = {"features": zarr.open_array(features_store, mode="r")}
 
-        group_name = "labels"
-        
         # get the labels
-        labels = _annotation_group(labels_store)
-        if group_name in labels:
-            labels = labels[group_name]
-        else:
-            labels = labels.create_array(group_name,
-                                           shape=image.shape[1:],
-                                           dtype="i4")
+        labels = _open_annotations(labels_store, image.shape[1:], True, image_level,
+                                   geometry, grouped=True)
 
         # get the segmentation
-        segmentation = _annotation_group(segmentation_store)
-        if group_name in segmentation:
-            segmentation = segmentation[group_name]
-        else:
-            segmentation = segmentation.create_array(group_name,
-                                                       shape=image.shape[1:],
-                                                       dtype="i4")
+        segmentation = _open_annotations(segmentation_store, image.shape[1:], True,
+                                         image_level, geometry, grouped=True)
 
         # TODO start a background thread that triggers downloads of the zarrs
             
