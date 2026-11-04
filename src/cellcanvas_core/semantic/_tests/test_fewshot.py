@@ -92,7 +92,6 @@ def test_invalid_inputs_raise():
         FewShotClassifier().fit(np.full_like(X, np.nan), y)
     for param in (
         {"knn_weight": 2.0},
-        {"knn_margin": -0.1},
         {"dropout": 1.0},
         {"n_neighbors": 0},
         {"max_bank_size": 0},
@@ -145,13 +144,18 @@ def test_predict_before_fit_raises():
         FewShotClassifier().predict(np.zeros((2, 3)))
 
 
-def test_bank_cap_keeps_small_classes():
-    X, y = blobs(100)
-    keep = np.concatenate([np.arange(200), np.arange(200, 205)])  # 100, 100, 5
+def test_bank_subsample_is_uniform_with_a_floor_per_class():
+    X, y = blobs(300)
+    keep = np.concatenate([np.arange(400), np.arange(600, 605)])  # 300, 100, 5
     for seed in range(5):
-        model = FewShotClassifier(max_bank_size=50, random_state=seed, **FAST)
+        model = FewShotClassifier(max_bank_size=100, random_state=seed, **FAST)
         bank_y = model.fit(X[keep], y[keep]).bank_[1]
-        np.testing.assert_array_equal(np.bincount(bank_y), [22, 23, 5])
+        counts = np.bincount(bank_y)
+        assert counts.sum() == 100 and counts[2] == 5  # 5 rows kept in full
+        assert 55 <= counts[0] <= 85 and 15 <= counts[1] <= 35  # about 3 : 1
+        bank_y = model.set_params(max_bank_size=30).fit(X[keep], y[keep]).bank_[1]
+        counts = np.bincount(bank_y)  # floor is max_bank_size // 3 = 10 rows
+        assert counts.sum() == 30 and counts[1] >= 10 and counts[2] == 5
 
 
 def test_single_predictors():
@@ -162,24 +166,6 @@ def test_single_predictors():
         assert (single.mlp_ is None) == (weight == 1.0)
         assert (single.bank_ is None) == (weight == 0.0)
         assert np.mean(single.predict(X) == y) > 0.95
-
-
-def test_knn_margin_limits_the_vote():
-    X, y = blobs(30)
-    model = FewShotClassifier(**FAST).fit(X, y)
-    X = np.random.default_rng(4).normal(size=(300, 16)).astype(np.float32) * 3
-    everywhere = model.predict_proba(X)
-    mlp = model.set_params(knn_margin=0.0).predict_proba(X)
-    np.testing.assert_allclose(
-        mlp, model.set_params(knn_weight=0).predict_proba(X), rtol=1e-5, atol=1e-6
-    )
-    np.testing.assert_array_equal(
-        model.set_params(knn_weight=0.5, knn_margin=1.1).predict_proba(X), everywhere
-    )
-    some = model.set_params(knn_margin=0.5).predict_proba(X)
-    voted = ~np.all(np.isclose(some, mlp), axis=1)
-    assert 0 < voted.sum() < len(X)
-    np.testing.assert_allclose(some[voted], everywhere[voted], rtol=1e-5, atol=1e-6)
 
 
 def test_predict_matches_predict_proba():
@@ -236,14 +222,10 @@ def test_torch_fits_and_predicts_as_numpy(device):
     model = FewShotClassifier(device=device, **FAST).fit(X, y)
     for name, value in expected.mlp_.items():
         np.testing.assert_allclose(model.mlp_[name], value, rtol=1e-3, atol=1e-5)
-    for margin in (None, 0.5):
-        expected.set_params(knn_margin=margin)
-        model.set_params(knn_margin=margin)
-        np.testing.assert_allclose(
-            model.predict_proba(query), expected.predict_proba(query), atol=1e-4
-        )
-        same = model.predict(query) == expected.predict(query)
-        assert same.mean() > 0.99
+    np.testing.assert_allclose(
+        model.predict_proba(query), expected.predict_proba(query), atol=1e-4
+    )
+    assert np.mean(model.predict(query) == expected.predict(query)) > 0.99
     # A model fitted with NumPy predicts with PyTorch and vice versa.
     expected.set_params(device=device)
     np.testing.assert_allclose(

@@ -53,13 +53,6 @@ class _NumPy:
     def top_k(self, a, k):
         return np.argpartition(a, -k, axis=1)[:, -k:]
 
-    def top2_gap(self, p):
-        top2 = np.partition(p, -2, axis=1)[:, -2:]
-        return top2[:, 1] - top2[:, 0]
-
-    def nonzero(self, a):
-        return np.flatnonzero(a)
-
 
 class _Torch:
     """The same operations on PyTorch tensors on one device."""
@@ -90,13 +83,6 @@ class _Torch:
 
     def top_k(self, a, k):
         return a.topk(k, dim=1).indices
-
-    def top2_gap(self, p):
-        top2 = p.topk(2, dim=1).values
-        return top2[:, 0] - top2[:, 1]
-
-    def nonzero(self, a):
-        return self.torch.nonzero(a).flatten()
 
 
 def _backend(device):
@@ -134,8 +120,7 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
 
     With PyTorch installed and a GPU available, fitting and prediction run on
     the GPU; otherwise they run on the CPU with NumPy. The kNN vote dominates
-    CPU prediction time: ``knn_margin`` limits it to rows the MLP is unsure
-    about, and ``knn_weight=0`` skips it.
+    CPU prediction time; ``knn_weight=0`` skips it.
 
     Parameters
     ----------
@@ -154,13 +139,10 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
     n_neighbors : int
         Number of most similar bank rows that vote.
     max_bank_size : int
-        Maximum number of rows in the kNN bank. Larger classes are subsampled
-        first, so a sparsely painted class keeps all of its rows.
+        Maximum number of rows in the kNN bank, a uniform subsample of the
+        painted rows in which every class keeps at least ``n_neighbors`` rows.
     knn_weight : float
         Weight of the kNN vote; the MLP gets ``1 - knn_weight``.
-    knn_margin : float or None
-        The kNN vote runs only on rows where the MLP's two most probable
-        classes differ by less than this. None runs it on every row.
     unlabelled : int or None
         Label of rows to ignore in `fit`. None uses every row.
     device : str
@@ -191,7 +173,6 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         n_neighbors: int = 16,
         max_bank_size: int = 20000,
         knn_weight: float = 0.5,
-        knn_margin: float | None = None,
         unlabelled: int | None = -1,
         device: str = "auto",
         random_state=0,
@@ -205,7 +186,6 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         self.n_neighbors = n_neighbors
         self.max_bank_size = max_bank_size
         self.knn_weight = knn_weight
-        self.knn_margin = knn_margin
         self.unlabelled = unlabelled
         self.device = device
         self.random_state = random_state
@@ -303,8 +283,6 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
     def _check_params(self):
         if not 0.0 <= self.knn_weight <= 1.0:
             raise ValueError("knn_weight must be between 0 and 1")
-        if self.knn_margin is not None and self.knn_margin < 0:
-            raise ValueError("knn_margin must be at least 0, or None")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be at least 0 and below 1")
         for name in ("hidden", "steps", "batch_size", "n_neighbors", "max_bank_size"):
@@ -355,14 +333,8 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         p = self._mlp_proba(X, mlp, xp)
         if self.knn_weight == 0:
             return p
-        rows = slice(None)
-        if self.knn_margin is not None:
-            rows = xp.nonzero(xp.top2_gap(p) < self.knn_margin)
-            if len(rows) == 0:
-                return p
         w = self.knn_weight
-        p[rows] = (1 - w) * p[rows] + w * self._knn_proba(X[rows], bank, xp)
-        return p
+        return (1 - w) * p + w * self._knn_proba(X, bank, xp)
 
     def _fit_mlp(self, X, y, n_classes, rng, xp):
         """Train the MLP with class-weighted cross-entropy and AdamW."""
@@ -432,13 +404,18 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         """Bank rows (L2-normalized), their class indices and vote weights."""
         counts = np.bincount(y, minlength=n_classes)
         if counts.sum() > self.max_bank_size:
-            # Fill the bank from the smallest class up, each class taking at
-            # most an equal share of the room left.
-            quota = np.zeros(n_classes, dtype=int)
-            left = self.max_bank_size
-            for i, c in enumerate(np.argsort(counts, kind="stable")):
-                quota[c] = min(counts[c], left // (n_classes - i))
-                left -= quota[c]
+            # A uniform subsample, except that every class keeps at least
+            # n_neighbors rows (taken from the largest classes) so that a
+            # sparsely painted class can still win a vote.
+            quota = rng.multivariate_hypergeometric(counts, self.max_bank_size)
+            floor = np.minimum(
+                counts, min(self.n_neighbors, self.max_bank_size // n_classes)
+            )
+            short = np.maximum(floor - quota, 0)
+            quota, excess = quota + short, short.sum()
+            for c in np.argsort(-quota, kind="stable"):
+                take = min(excess, quota[c] - floor[c])
+                quota[c], excess = quota[c] - take, excess - take
             keep = np.concatenate(
                 [
                     rng.choice(np.flatnonzero(y == c), quota[c], replace=False)
