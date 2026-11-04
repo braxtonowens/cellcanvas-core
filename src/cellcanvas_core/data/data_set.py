@@ -1,14 +1,30 @@
-import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Union
 
-import numpy as np
 import dask.array as da
 import zarr
 from zarr import Array
 
-from ome_zarr.io import ZarrLocation
-from ome_zarr.reader import Multiscales
+from cellcanvas_core.data._image import open_image
+
+
+def _open_annotations(path, shape, create, level):
+    try:
+        node = zarr.open(path, mode="r+")
+    except FileNotFoundError:
+        if not create:
+            raise
+        return zarr.open_array(path, mode="a", shape=shape, dtype="i4", zarr_format=3)
+    if isinstance(node, zarr.Group):
+        node, _ = open_image(path, level=level, axes=("z", "y", "x"), mode="r+")
+    return node
+
+
+def _annotation_group(store):
+    try:
+        return zarr.open_group(store, mode="r+")
+    except FileNotFoundError:
+        return zarr.open_group(store, mode="a", zarr_format=3)
 
 @dataclass
 class DataSet:
@@ -24,6 +40,7 @@ class DataSet:
     labels: Array
     segmentation: Array
     feature_axis: int = 0
+    image_metadata: Dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.image.ndim != 4 or any(size == 0 for size in self.image.shape):
@@ -70,49 +87,29 @@ class DataSet:
         segmentation_path: str,
         make_missing_datasets: bool = False,
         feature_axis: int = 0,
+        image_level: int = 0,
     ):
         """Create a DataSet from a set of paths.
 
         todo: add ability to create missing labels/segmentations
         """
         # get the image
-        image = zarr.open(image_path, "r")
-        if image.ndim != 4 or any(size == 0 for size in image.shape):
-            raise ValueError("Images must have nonempty (C, Z, Y, X) axes")
+        image, image_metadata = open_image(image_path, level=image_level)
 
         # get the features
         if isinstance(features_path, str):
             features_path = [features_path]
-        features = {path: zarr.open(path, "r") for path in features_path}
+        features = {path: zarr.open_array(path, mode="r") for path in features_path}
 
         # get the labels
-        if (not os.path.isdir(labels_path)) and make_missing_datasets:
-            labels = zarr.open(
-                labels_path,
-                mode="a",
-                shape=image.shape[1:],
-                dtype="i4",
-                dimension_separator=".",
-            )
-        else:
-            if Multiscales.matches(ZarrLocation(labels_path)):
-                labels = zarr.open(os.path.join(labels_path, "0"),
-                                   "a")
-            else:
-                labels = zarr.open(labels_path, "a")
+        labels = _open_annotations(
+            labels_path, image.shape[1:], make_missing_datasets, image_level
+        )
 
         # get the segmentation
-        if (not os.path.isdir(segmentation_path)) and make_missing_datasets:
-            segmentation = zarr.open(
-                segmentation_path,
-                mode="a",
-                shape=image.shape[1:],
-                dtype="i4",
-                dimension_separator=".",
-            )
-
-        else:
-            segmentation = zarr.open(segmentation_path, mode="a")
+        segmentation = _open_annotations(
+            segmentation_path, image.shape[1:], make_missing_datasets, image_level
+        )
 
         return cls(
             image=image,
@@ -120,6 +117,7 @@ class DataSet:
             labels=labels,
             segmentation=segmentation,
             feature_axis=feature_axis,
+            image_metadata=image_metadata,
         )
 
     @classmethod
@@ -130,6 +128,7 @@ class DataSet:
         labels_store,
         segmentation_store,
         feature_axis: int = 0,
+        image_level: int = 0,
     ):
         """Create a DataSet from a set of paths.
 
@@ -138,33 +137,28 @@ class DataSet:
         # TODO rewrite this to copy everything to be local
         
         # get the image
-        # TODO fix hardcoded scale for pickathon
-        image = zarr.open(zarr.storage.LRUStoreCache(image_store, None), "r")["0"]
-        if image.ndim != 4 or any(size == 0 for size in image.shape):
-            raise ValueError("Images must have nonempty (C, Z, Y, X) axes")
+        image, image_metadata = open_image(image_store, level=image_level)
 
         # get the features
-        features = {"features": zarr.open(zarr.storage.LRUStoreCache(features_store, None), "r")}
+        features = {"features": zarr.open_array(features_store, mode="r")}
 
         group_name = "labels"
         
         # get the labels
-        labels = zarr.open_group(zarr.storage.LRUStoreCache(labels_store, None),
-                                 mode="a")
+        labels = _annotation_group(labels_store)
         if group_name in labels:
             labels = labels[group_name]
         else:
-            labels = labels.create_dataset(group_name,
+            labels = labels.create_array(group_name,
                                            shape=image.shape[1:],
                                            dtype="i4")
 
         # get the segmentation
-        segmentation = zarr.open_group(zarr.storage.LRUStoreCache(segmentation_store, None),
-                                       mode="a")
+        segmentation = _annotation_group(segmentation_store)
         if group_name in segmentation:
             segmentation = segmentation[group_name]
         else:
-            segmentation = segmentation.create_dataset(group_name,
+            segmentation = segmentation.create_array(group_name,
                                                        shape=image.shape[1:],
                                                        dtype="i4")
 
@@ -176,4 +170,5 @@ class DataSet:
             labels=labels,
             segmentation=segmentation,
             feature_axis=feature_axis,
+            image_metadata=image_metadata,
         )

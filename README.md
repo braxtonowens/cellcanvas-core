@@ -8,6 +8,8 @@
 
 Core components for CellCanvas
 
+Requires Python 3.11+ and Zarr 3. New annotations use Zarr format 3.
+
 ## Array dimensions
 
 - Images: **CZYX** (channel, depth, row, column); **BCZYX** with a batch axis.
