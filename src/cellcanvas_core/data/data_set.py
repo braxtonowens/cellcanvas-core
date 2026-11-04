@@ -6,6 +6,7 @@ import zarr
 from zarr import Array
 
 from cellcanvas_core.data._image import open_image
+from cellcanvas_core.data._geometry import SpatialTransform, spatial_transform
 
 
 def _open_annotations(path, shape, create, level):
@@ -41,6 +42,7 @@ class DataSet:
     segmentation: Array
     feature_axis: int = 0
     image_metadata: Dict = field(default_factory=dict)
+    image_level: int = 0
 
     def __post_init__(self):
         if self.image.ndim != 4 or any(size == 0 for size in self.image.shape):
@@ -59,6 +61,11 @@ class DataSet:
                 raise ValueError(f"Feature {name} does not match the image shape")
         if self.labels.shape != spatial_shape or self.segmentation.shape != spatial_shape:
             raise ValueError("Labels and segmentation must match the image spatial shape (Z, Y, X)")
+
+    @property
+    def spatial_transform(self) -> SpatialTransform:
+        """Image scale, origin and units for aligning ZYX annotations."""
+        return spatial_transform(self.image_metadata, self.image_level)
 
     @property
     def concatenated_features(self) -> da.Array:
@@ -118,6 +125,7 @@ class DataSet:
             segmentation=segmentation,
             feature_axis=feature_axis,
             image_metadata=image_metadata,
+            image_level=image_level,
         )
 
     @classmethod
@@ -171,4 +179,5 @@ class DataSet:
             segmentation=segmentation,
             feature_axis=feature_axis,
             image_metadata=image_metadata,
+            image_level=image_level,
         )

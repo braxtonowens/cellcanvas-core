@@ -4,6 +4,8 @@ from copy import deepcopy
 
 import zarr
 
+from cellcanvas_core.data._geometry import spatial_transform
+
 
 def open_image(source, level=0, axes=("c", "z", "y", "x"), mode="r"):
     """Return a CZYX array and a copy of its source metadata.
@@ -65,4 +67,6 @@ def open_image(source, level=0, axes=("c", "z", "y", "x"), mode="r"):
     dimension_names = getattr(image.metadata, "dimension_names", None)
     if (require_dimension_names or dimension_names is not None) and dimension_names != tuple(axes):
         raise ValueError("Array dimension_names must match the declared axes")
+    if axes == ("c", "z", "y", "x"):
+        spatial_transform(metadata, level)
     return image, metadata
