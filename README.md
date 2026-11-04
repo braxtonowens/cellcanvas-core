@@ -7,3 +7,12 @@
 [![codecov](https://codecov.io/gh/cellcanvas/cellcanvas-core/branch/main/graph/badge.svg)](https://codecov.io/gh/cellcanvas/cellcanvas-core)
 
 Core components for CellCanvas
+
+## Array dimensions
+
+- Images: **CZYX** (channel, depth, row, column); **BCZYX** with a batch axis.
+- 2D images keep **Z=1**. Add a channel axis to legacy ZYX images.
+- Labels: **ZYX**, shared across channels; zero is unannotated. Add one to
+  classifier predictions before saving as labels.
+- Features: **DZYX**, where D is feature width. Use `feature_axis=-1` for
+  ZYXD inputs. Keep feature order consistent between training and prediction.

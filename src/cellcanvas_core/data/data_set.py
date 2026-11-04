@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Union
 
 import numpy as np
+import dask.array as da
 import zarr
 from zarr import Array
 
@@ -11,20 +12,47 @@ from ome_zarr.reader import Multiscales
 
 @dataclass
 class DataSet:
-    """Container for the data relating to a single tomogram"""
+    """CZYX image, feature-first DZYX arrays and shared ZYX annotations.
+
+    D is the classifier feature width, distinct from image channels C.
+    Two-dimensional images retain a singleton Z axis. No time or batch axis
+    is stored here; model adapters add a leading batch axis to images.
+    """
 
     image: Array
     features: Dict[str, Array]
     labels: Array
     segmentation: Array
+    feature_axis: int = 0
+
+    def __post_init__(self):
+        if self.image.ndim != 4 or any(size == 0 for size in self.image.shape):
+            raise ValueError("Images must have nonempty (C, Z, Y, X) axes")
+        spatial_shape = self.image.shape[1:]
+        if not self.features:
+            raise ValueError("At least one feature array is required")
+        for name, values in self.features.items():
+            if values.ndim != 4:
+                raise ValueError(f"Feature {name} needs one channel axis and the image spatial axes")
+            axis = self.feature_axis % values.ndim
+            if not -values.ndim <= self.feature_axis < values.ndim:
+                raise ValueError("feature_axis is outside the feature array")
+            spatial = values.shape[:axis] + values.shape[axis + 1:]
+            if spatial != spatial_shape or values.shape[axis] == 0:
+                raise ValueError(f"Feature {name} does not match the image shape")
+        if self.labels.shape != spatial_shape or self.segmentation.shape != spatial_shape:
+            raise ValueError("Labels and segmentation must match the image spatial shape (Z, Y, X)")
 
     @property
-    def concatenated_features(self) -> np.ndarray:
-        """Return all of the features concatenated into a single array."""
-        features_list = list(self.features.values())
-        if len(features_list) == 1:
-            return features_list[0]
-        return np.concatenate(features_list, axis=-1)
+    def concatenated_features(self) -> da.Array:
+        """Return lazy channel-first features in dictionary insertion order.
+
+        Set feature_axis=-1 for prototype arrays with channels last. Reading
+        this property builds a task graph without loading the whole volume.
+        """
+        features = [da.moveaxis(da.asarray(value), self.feature_axis, 0)
+                    for value in self.features.values()]
+        return da.concatenate(features, axis=0)
 
     def __hash__(self):
         """Simple hash function, should updated in the future.
@@ -41,6 +69,7 @@ class DataSet:
         labels_path: str,
         segmentation_path: str,
         make_missing_datasets: bool = False,
+        feature_axis: int = 0,
     ):
         """Create a DataSet from a set of paths.
 
@@ -48,6 +77,8 @@ class DataSet:
         """
         # get the image
         image = zarr.open(image_path, "r")
+        if image.ndim != 4 or any(size == 0 for size in image.shape):
+            raise ValueError("Images must have nonempty (C, Z, Y, X) axes")
 
         # get the features
         if isinstance(features_path, str):
@@ -59,7 +90,7 @@ class DataSet:
             labels = zarr.open(
                 labels_path,
                 mode="a",
-                shape=image.shape,
+                shape=image.shape[1:],
                 dtype="i4",
                 dimension_separator=".",
             )
@@ -75,7 +106,7 @@ class DataSet:
             segmentation = zarr.open(
                 segmentation_path,
                 mode="a",
-                shape=image.shape,
+                shape=image.shape[1:],
                 dtype="i4",
                 dimension_separator=".",
             )
@@ -88,6 +119,7 @@ class DataSet:
             features=features,
             labels=labels,
             segmentation=segmentation,
+            feature_axis=feature_axis,
         )
 
     @classmethod
@@ -97,6 +129,7 @@ class DataSet:
         features_store,
         labels_store,
         segmentation_store,
+        feature_axis: int = 0,
     ):
         """Create a DataSet from a set of paths.
 
@@ -107,6 +140,8 @@ class DataSet:
         # get the image
         # TODO fix hardcoded scale for pickathon
         image = zarr.open(zarr.storage.LRUStoreCache(image_store, None), "r")["0"]
+        if image.ndim != 4 or any(size == 0 for size in image.shape):
+            raise ValueError("Images must have nonempty (C, Z, Y, X) axes")
 
         # get the features
         features = {"features": zarr.open(zarr.storage.LRUStoreCache(features_store, None), "r")}
@@ -120,7 +155,7 @@ class DataSet:
             labels = labels[group_name]
         else:
             labels = labels.create_dataset(group_name,
-                                           shape=image.shape,
+                                           shape=image.shape[1:],
                                            dtype="i4")
 
         # get the segmentation
@@ -130,7 +165,7 @@ class DataSet:
             segmentation = segmentation[group_name]
         else:
             segmentation = segmentation.create_dataset(group_name,
-                                                       shape=image.shape,
+                                                       shape=image.shape[1:],
                                                        dtype="i4")
 
         # TODO start a background thread that triggers downloads of the zarrs
@@ -140,4 +175,5 @@ class DataSet:
             features=features,
             labels=labels,
             segmentation=segmentation,
+            feature_axis=feature_axis,
         )

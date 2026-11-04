@@ -30,6 +30,8 @@ class DataManager:
 
         features = []
         labels = []
+        if not self.datasets:
+            raise ValueError("At least one dataset is required for training")
         for dataset in self.datasets:
             dataset_features = da.asarray(dataset.concatenated_features)
             dataset_labels = da.asarray(dataset.labels)
@@ -38,6 +40,8 @@ class DataManager:
 
             # Compute valid_indices based on labels > 0
             valid_indices = da.nonzero(flattened_labels > 0)[0].compute()
+            if len(valid_indices) == 0:
+                continue
 
             # Flatten only the spatial dimensions of the dataset_features while preserving the feature dimension
             c, h, w, d = dataset_features.shape
@@ -56,4 +60,6 @@ class DataManager:
             features.append(filtered_features)
             labels.append(filtered_labels)
 
+        if not features:
+            raise ValueError("Paint at least one positive label before training")
         return da.concatenate(features), da.concatenate(labels)

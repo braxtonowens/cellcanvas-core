@@ -51,24 +51,41 @@ class SemanticSegmentationManager:
 
         self.model.fit(features_computed, labels_computed)
 
-    def predict(self, feature_image):
+    def predict(self, feature_image, batch_size=65536):
         """Predict using the trained model.
 
         Parameters
         ----------
-        feature_image : np.ndarray
-            (z, y, x, c) image where c is the dimensionality of the features.
+        feature_image : array-like
+            (c, z, y, x) NumPy, Dask or Zarr array.
+        batch_size : int
+            Maximum number of feature rows passed to the model per call.
+            Source chunks and the complete output labels also occupy memory.
 
         Returns
         -------
         predicted_labels : Array
-            The prediction of class.
+            Zero-based model classes. Add one before storing as painted labels,
+            where zero means unannotated and positive values are classes.
         """
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        feature_image = da.asarray(feature_image)
+        if feature_image.ndim != 4 or any(size == 0 for size in feature_image.shape):
+            raise ValueError("Features must have nonempty (c, z, y, x) axes")
         c, z, y, x = feature_image.shape
         features = feature_image.transpose(1, 2, 3, 0).reshape(-1, c)
 
         try:
-            predicted_labels = self.model.predict(features)
+            predicted_labels = None
+            for start in range(0, features.shape[0], batch_size):
+                stop = min(start + batch_size, features.shape[0])
+                batch = np.asarray(self.model.predict(features[start:stop].compute()))
+                if batch.shape != (stop - start,):
+                    raise ValueError("Model must return one class per feature row")
+                if predicted_labels is None:
+                    predicted_labels = np.empty(features.shape[0], dtype=batch.dtype)
+                predicted_labels[start:stop] = batch
         except NotFittedError:
             raise NotFittedError(
                 "You must train the classifier `clf` first"
