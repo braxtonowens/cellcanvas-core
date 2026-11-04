@@ -1,3 +1,6 @@
+import pickle
+import sys
+
 import numpy as np
 import pytest
 from sklearn.base import clone
@@ -89,6 +92,7 @@ def test_invalid_inputs_raise():
         FewShotClassifier().fit(np.full_like(X, np.nan), y)
     for param in (
         {"knn_weight": 2.0},
+        {"knn_margin": -0.1},
         {"dropout": 1.0},
         {"n_neighbors": 0},
         {"max_bank_size": 0},
@@ -105,6 +109,35 @@ def test_single_class_predicts_that_class():
     model = FewShotClassifier().fit(X, np.full(len(X), 4))
     np.testing.assert_array_equal(model.predict(X), 4)
     np.testing.assert_array_equal(model.predict_proba(X), 1)
+    np.testing.assert_array_equal(model.predict_proba(np.full_like(X, np.nan)), 1)
+
+
+def test_unlabelled_rows_may_be_non_finite():
+    X, y = blobs(10, n_classes=2)
+    X_all = np.concatenate([X, np.full((3, X.shape[1]), np.nan, dtype=np.float32)])
+    y_all = np.concatenate([y, np.full(3, -1)])
+    model = FewShotClassifier(**FAST).fit(X_all, y_all)
+    assert np.mean(model.predict(X) == y) > 0.95
+
+
+def test_knn_weight_change_after_fit_needs_refit():
+    X, y = blobs(10)
+    model = FewShotClassifier(knn_weight=0.0, **FAST).fit(X, y)
+    with pytest.raises(ValueError, match="call fit again"):
+        model.set_params(knn_weight=1.0).predict(X)
+    model = FewShotClassifier(knn_weight=1.0, **FAST).fit(X, y)
+    with pytest.raises(ValueError, match="call fit again"):
+        model.set_params(knn_weight=0.5).predict(X)
+    with pytest.raises(ValueError, match="knn_weight"):
+        model.set_params(knn_weight=2.0).predict(X)
+
+
+def test_failed_refit_keeps_the_old_model():
+    X, y = blobs(10)
+    model = FewShotClassifier(**FAST).fit(X, y)
+    with pytest.raises(ValueError):
+        model.fit(X, y[:-1])
+    assert np.mean(model.predict(X) == y) > 0.95
 
 
 def test_predict_before_fit_raises():
@@ -137,9 +170,11 @@ def test_knn_margin_limits_the_vote():
     X = np.random.default_rng(4).normal(size=(300, 16)).astype(np.float32) * 3
     everywhere = model.predict_proba(X)
     mlp = model.set_params(knn_margin=0.0).predict_proba(X)
-    np.testing.assert_allclose(mlp, model._mlp_proba(X), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        mlp, model.set_params(knn_weight=0).predict_proba(X), rtol=1e-5, atol=1e-6
+    )
     np.testing.assert_array_equal(
-        model.set_params(knn_margin=1.1).predict_proba(X), everywhere
+        model.set_params(knn_weight=0.5, knn_margin=1.1).predict_proba(X), everywhere
     )
     some = model.set_params(knn_margin=0.5).predict_proba(X)
     voted = ~np.all(np.isclose(some, mlp), axis=1)
@@ -188,3 +223,43 @@ def test_segmentation_manager_end_to_end():
     prediction = manager.predict(features)
     assert prediction.shape == shape
     assert np.mean(prediction == truth) > 0.95
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_torch_fits_and_predicts_as_numpy(device):
+    torch = pytest.importorskip("torch")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no GPU")
+    X, y = blobs(30)
+    query = np.random.default_rng(4).normal(size=(300, 16)).astype(np.float32) * 3
+    expected = FewShotClassifier(device="numpy", **FAST).fit(X, y)
+    model = FewShotClassifier(device=device, **FAST).fit(X, y)
+    for name, value in expected.mlp_.items():
+        np.testing.assert_allclose(model.mlp_[name], value, rtol=1e-3, atol=1e-5)
+    for margin in (None, 0.5):
+        expected.set_params(knn_margin=margin)
+        model.set_params(knn_margin=margin)
+        np.testing.assert_allclose(
+            model.predict_proba(query), expected.predict_proba(query), atol=1e-4
+        )
+        same = model.predict(query) == expected.predict(query)
+        assert same.mean() > 0.99
+    # A model fitted with NumPy predicts with PyTorch and vice versa.
+    expected.set_params(device=device)
+    np.testing.assert_allclose(
+        expected.predict_proba(query), model.predict_proba(query), atol=1e-4
+    )
+    # Pickling leaves the device arrays behind; the copy predicts the same.
+    restored = pickle.loads(pickle.dumps(model))
+    assert "_on_device" not in restored.__dict__
+    np.testing.assert_array_equal(restored.predict(query), model.predict(query))
+
+
+def test_device_without_torch(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", None)
+    X, y = blobs(10)
+    model = FewShotClassifier(**FAST).fit(X, y)  # "auto" falls back to NumPy
+    assert np.mean(model.predict(X) == y) > 0.95
+    with pytest.raises(ImportError, match="PyTorch"):
+        model.set_params(device="cuda").fit(X, y)
+    assert np.mean(model.set_params(device="numpy").predict(X) == y) > 0.95
