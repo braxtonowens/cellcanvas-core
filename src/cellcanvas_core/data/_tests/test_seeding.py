@@ -1,3 +1,4 @@
+import dask.array as da
 import numpy as np
 import pytest
 from sklearn.tree import DecisionTreeClassifier
@@ -95,3 +96,40 @@ def test_seeds_keep_the_cube_from_flooding():
     prediction = seeded.predict(features)
     assert np.mean(prediction[cube] == 1) > 0.9
     assert np.mean(prediction[~cube] == 0) > 0.9
+
+
+class Recorder:
+    """An array that records which regions are read."""
+
+    def __init__(self, values):
+        self.values, self.reads = values, []
+        self.shape, self.dtype, self.ndim = values.shape, values.dtype, values.ndim
+
+    def __getitem__(self, key):
+        self.reads.append(key)
+        return self.values[key]
+
+
+def test_only_some_chunks_are_read():
+    features, labels, _ = volume()
+    recorder = Recorder(features)
+    chunked = da.from_array(recorder, chunks=(3, 1, 10, 10), asarray=True)  # 16 chunks
+    ds = DataSet(
+        np.zeros((1, *SHAPE)), {"features": chunked}, labels, np.zeros_like(labels)
+    )
+    idx = SeededDataManager([ds], n_candidates=50, max_seeds=10).seed_indices(ds)
+    regions = {tuple((k.start, k.stop) for k in key[1:]) for key in recorder.reads}
+    assert 0 < len(regions) < 16  # 50 voxels of 100-voxel chunks: two chunks read
+    z, y, x = np.unravel_index(idx, SHAPE)
+    for point in zip(z, y, x, strict=True):
+        assert any(
+            all(a <= p < b for p, (a, b) in zip(point, r, strict=True)) for r in regions
+        )
+
+
+def test_non_finite_features_raise():
+    features, labels, _ = volume()
+    features[:] = np.nan
+    ds = dataset(features, labels)
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        SeededDataManager([ds]).get_training_data()
