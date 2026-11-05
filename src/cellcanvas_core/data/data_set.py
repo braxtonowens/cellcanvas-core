@@ -9,6 +9,18 @@ from cellcanvas_core.data._image import open_image
 from cellcanvas_core.data._geometry import SpatialTransform, spatial_transform, validate_alignment
 
 
+def _lazy(value):
+    """A dask array over value, with a Zarr array's own storage chunks.
+
+    da.asarray would rechunk a Zarr array to dask's chunk-size limit (128 MiB
+    by default), and blocks that cut across storage chunks decode each storage
+    chunk many times.
+    """
+    if isinstance(value, Array):
+        return da.from_zarr(value)
+    return da.asarray(value)
+
+
 def _open_annotations(path, shape, create, level, expected, grouped=False):
     try:
         node = zarr.open(path, mode="r+")
@@ -88,8 +100,10 @@ class DataSet:
 
         Set feature_axis=-1 for prototype arrays with channels last. Reading
         this property builds a task graph without loading the whole volume.
+        Zarr arrays keep their storage chunks as dask chunks, so each chunk
+        is read once per pass however large it is.
         """
-        features = [da.moveaxis(da.asarray(value), self.feature_axis, 0)
+        features = [da.moveaxis(_lazy(value), self.feature_axis, 0)
                     for value in self.features.values()]
         return da.concatenate(features, axis=0)
 
