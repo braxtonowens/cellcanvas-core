@@ -299,6 +299,8 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
             raise ValueError(
                 f"Expected X with shape (n, {self.n_features_in_}), got {X.shape}"
             )
+        if not np.isfinite(X).all():
+            raise ValueError("Features contain NaN or infinite values")
         if self.knn_weight < 1 and self.mlp_ is None and len(self.classes_) > 1:
             raise ValueError("knn_weight was 1 at fit time; call fit again")
         if self.knn_weight > 0 and self.bank_ is None and len(self.classes_) > 1:

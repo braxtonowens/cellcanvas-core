@@ -101,6 +101,11 @@ def test_invalid_inputs_raise():
     model = FewShotClassifier(**FAST).fit(X, y)
     with pytest.raises(ValueError, match="shape"):
         model.predict(X[:, :3])
+    X_bad = X.copy()
+    X_bad[0, 0], X_bad[1, 1] = np.nan, np.inf
+    for method in (model.predict, model.predict_proba):
+        with pytest.raises(ValueError, match="NaN or infinite"):
+            method(X_bad)
 
 
 def test_single_class_predicts_that_class():
@@ -108,7 +113,6 @@ def test_single_class_predicts_that_class():
     model = FewShotClassifier().fit(X, np.full(len(X), 4))
     np.testing.assert_array_equal(model.predict(X), 4)
     np.testing.assert_array_equal(model.predict_proba(X), 1)
-    np.testing.assert_array_equal(model.predict_proba(np.full_like(X, np.nan)), 1)
 
 
 def test_unlabelled_rows_may_be_non_finite():
