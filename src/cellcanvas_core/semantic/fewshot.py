@@ -106,8 +106,8 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
     """MLP and class-balanced kNN vote on frozen features, averaged.
 
     Meant for a few painted voxels on features from a frozen, pretrained
-    network. Features are used as given and should be standardized per
-    channel over the whole volume, not over the painted rows. Labels follow
+    network. Features are used as given, without scaling; the kNN vote
+    compares L2-normalized rows. Labels follow
     `DataManager.get_training_data`: unannotated voxels are dropped there,
     `fit` also ignores rows labelled ``unlabelled``, and `predict` returns
     the labels seen in `fit`, so the "add one before saving" rule of
