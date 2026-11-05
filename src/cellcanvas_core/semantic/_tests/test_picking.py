@@ -1,7 +1,11 @@
 import numpy as np
+import pytest
 from sklearn.base import BaseEstimator
+from sklearn.exceptions import NotFittedError
+from sklearn.tree import DecisionTreeClassifier
 
-from cellcanvas_core.semantic.picking import pick, pick_classes, predict_proba
+from cellcanvas_core.semantic.picking import pick, pick_classes
+from cellcanvas_core.semantic.segmentation_manager import SemanticSegmentationManager
 
 SHAPE = (24, 48, 48)
 R = 4.0
@@ -11,7 +15,7 @@ def blobs(centres, heights, sigma=2.0):
     """A probability volume with a Gaussian blob of each height at each centre."""
     grid = np.stack(np.meshgrid(*[np.arange(n) for n in SHAPE], indexing="ij"), -1)
     prob = np.zeros(SHAPE, dtype=np.float32)
-    for c, h in zip(centres, heights):
+    for c, h in zip(centres, heights, strict=True):
         prob += h * np.exp(-((grid - c) ** 2).sum(-1) / (2 * sigma**2))
     return np.clip(prob, 0, 1)
 
@@ -51,9 +55,9 @@ def test_anisotropic_spacing_scales_the_suppression():
 
 
 class ProbaModel(BaseEstimator):
-    """Two classes; class 1 where the first feature is positive."""
+    """Model classes 0 and 2 (painted labels 1 and 3); class 2 where feature 0 > 0."""
 
-    classes_ = np.array([0, 1])
+    classes_ = np.array([0, 2])
 
     def fit(self, X, y):
         return self
@@ -63,17 +67,63 @@ class ProbaModel(BaseEstimator):
         return np.stack([1 - p, p], 1)
 
 
-def test_predict_proba_and_pick_classes():
+def test_predict_proba_and_pick_classes_by_stored_label():
     features = np.zeros((2, *SHAPE), dtype=np.float32)
     features[0] = 8 * blobs([(12, 12, 12), (12, 36, 36)], [1.0, 1.0]) - 4
-
-    class Manager:
-        model = ProbaModel()
-
-    proba = predict_proba(Manager(), features, batch_size=1000)
-    assert proba.shape == (2, *SHAPE)
+    manager = SemanticSegmentationManager(None, ProbaModel())
+    proba = manager.predict_proba(features, batch_size=1000)
+    assert proba.shape == (2, *SHAPE) and proba.dtype == np.float32
     np.testing.assert_allclose(proba.sum(0), 1, rtol=1e-5)
-    picks = pick_classes(proba, {1: R})
-    assert picks.shape == (2, 5) and np.all(picks[:, 4] == 1)
+    labels = manager.model.classes_ + 1  # stored labels 1 and 3
+    picks = pick_classes(proba, {3: R}, labels)
+    assert picks.shape == (2, 5) and np.all(picks[:, 4] == 3)
     assert np.abs(np.sort(picks[:, 1]) - [12, 36]).max() < 1.0
-    assert pick_classes(proba, {}).shape == (0, 5)
+    assert pick_classes(proba, {}, labels).shape == (0, 5)
+    with pytest.raises(ValueError, match="label 2"):
+        pick_classes(proba, {2: R}, labels)
+    with pytest.raises(ValueError, match="one stored label"):
+        pick_classes(proba, {3: R}, [1, 2, 3])
+    assert np.all(pick_classes(proba, {2: R})[:, 4] == 2)  # default labels 1, 2
+
+
+def test_predict_proba_checks_the_model():
+    features = np.zeros((2, 2, 3, 4), dtype=np.float32)
+    with pytest.raises(NotFittedError):
+        SemanticSegmentationManager(None, DecisionTreeClassifier()).predict_proba(
+            features
+        )
+
+    class LabelsOnly:
+        def predict(self, X):
+            return np.zeros(len(X), dtype=int)
+
+    with pytest.raises(TypeError, match="predict_proba"):
+        SemanticSegmentationManager(None, LabelsOnly()).predict_proba(features)
+    with pytest.raises(ValueError, match="batch_size"):
+        SemanticSegmentationManager(None, ProbaModel()).predict_proba(features, 0)
+
+
+def test_invalid_pick_arguments():
+    prob = blobs([(12, 24, 24)], [0.9])
+    for kwargs, match in (
+        ({"radius": 0}, "radius"),
+        ({"radius": R, "edge": -1}, "edge"),
+        ({"radius": R, "spacing": (1, 1)}, "spacing"),
+        ({"radius": R, "spacing": (0, 1, 1)}, "spacing"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            pick(prob, **kwargs)
+    with pytest.raises(ValueError, match="volume"):
+        pick(prob[0], R)
+
+
+def test_a_particle_near_a_brighter_face_peak():
+    # the smoothing merges maxima closer than about 1.5 radii; the merged
+    # maximum sits at the face and is dropped (documented in pick)
+    face = (12, 0, 24)
+    merged = blobs([face, (12, R + 1, 24)], [1.0, 0.6], sigma=1.0)
+    assert len(pick(merged, R)[0]) == 0
+    assert len(pick(merged, R, edge=0)[0]) == 1
+    # further in, the maxima stay apart and only the face peak is dropped
+    points, _ = pick(blobs([face, (12, 1.5 * R, 24)], [1.0, 0.6], sigma=1.0), R)
+    assert len(points) == 1 and abs(points[0, 1] - 1.5 * R) < 1.0
