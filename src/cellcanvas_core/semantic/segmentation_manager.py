@@ -70,13 +70,7 @@ class SemanticSegmentationManager:
             Zero-based model classes. Add one before storing as painted labels,
             where zero means unannotated and positive values are classes.
         """
-        if not isinstance(batch_size, int) or batch_size <= 0:
-            raise ValueError("batch_size must be a positive integer")
-        feature_image = da.asarray(feature_image)
-        if feature_image.ndim != 4 or any(size == 0 for size in feature_image.shape):
-            raise ValueError("Features must have nonempty (c, z, y, x) axes")
-        c, z, y, x = feature_image.shape
-        features = feature_image.transpose(1, 2, 3, 0).reshape(-1, c)
+        features, shape = self._feature_rows(feature_image, batch_size)
 
         try:
             predicted_labels = None
@@ -94,7 +88,58 @@ class SemanticSegmentationManager:
                 "for example with the `fit_segmenter` function."
             ) from None
 
-        return predicted_labels.reshape(feature_image.shape[1:])
+        return predicted_labels.reshape(shape)
+
+    def predict_proba(self, feature_image, batch_size=65536):
+        """Class probabilities of every voxel, for models with predict_proba.
+
+        Parameters
+        ----------
+        feature_image : array-like
+            (c, z, y, x) NumPy, Dask or Zarr array, as for `predict`.
+        batch_size : int
+            Maximum number of feature rows passed to the model per call.
+
+        Returns
+        -------
+        probabilities : np.ndarray
+            (n_classes, z, y, x) float32, one volume per class in
+            ``model.classes_`` order. The stored label of volume i is
+            ``model.classes_[i] + 1``.
+        """
+        features, shape = self._feature_rows(feature_image, batch_size)
+        if not hasattr(self.model, "predict_proba"):
+            raise TypeError("The model has no predict_proba")
+        try:
+            probabilities = None
+            for start in range(0, features.shape[0], batch_size):
+                stop = min(start + batch_size, features.shape[0])
+                rows = features[start:stop].compute()
+                batch = np.asarray(self.model.predict_proba(rows), dtype=np.float32)
+                if batch.ndim != 2 or batch.shape[0] != stop - start:
+                    raise ValueError("Model must return one probability row per feature row")
+                if probabilities is None:
+                    probabilities = np.empty((batch.shape[1], features.shape[0]), np.float32)
+                probabilities[:, start:stop] = batch.T
+        except NotFittedError:
+            raise NotFittedError(
+                "You must train the classifier `clf` first"
+                "for example with the `fit_segmenter` function."
+            ) from None
+
+        return probabilities.reshape((-1, *shape))
+
+    @staticmethod
+    def _feature_rows(feature_image, batch_size):
+        """Validated (c, z, y, x) features as lazy (n, c) rows, and (z, y, x)."""
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        feature_image = da.asarray(feature_image)
+        if feature_image.ndim != 4 or any(size == 0 for size in feature_image.shape):
+            raise ValueError("Features must have nonempty (c, z, y, x) axes")
+        c = feature_image.shape[0]
+        rows = feature_image.transpose(1, 2, 3, 0).reshape(-1, c)
+        return rows, feature_image.shape[1:]
 
     def predict_to_segmentation(self, dataset: DataSet, batch_size=65536):
         """Write positive class labels to the dataset in spatial blocks.
