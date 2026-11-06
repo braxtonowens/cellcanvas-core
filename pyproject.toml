@@ -47,6 +47,8 @@ dependencies = [
 [project.optional-dependencies]
 # add dependencies used for testing here
 test = ["pytest", "pytest-cov"]
+# PyTorch for FewShotClassifier on the GPU
+gpu = ["torch"]
 # add anything else you like to have in your dev environment here
 dev = [
     "ipython",
