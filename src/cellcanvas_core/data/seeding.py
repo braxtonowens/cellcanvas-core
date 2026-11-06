@@ -9,6 +9,7 @@ import dask.array as da
 import numpy as np
 
 from cellcanvas_core.data.data_manager import DataManager
+from cellcanvas_core.data.data_set import _lazy
 
 if TYPE_CHECKING:
     from cellcanvas_core.data.data_set import DataSet
@@ -28,7 +29,7 @@ def _sample_voxels(features, labels, n, rng):
     features = da.asarray(features)
     spatial = features.shape[1:]
     chunks = features.chunks[1:]
-    labels = da.asarray(labels).rechunk(chunks)
+    labels = _lazy(labels).rechunk(chunks)
     starts = [np.cumsum((0, *c)) for c in chunks]
     blocks = list(product(*(range(len(c)) for c in chunks)))
     chosen, sizes = [], []
@@ -98,7 +99,10 @@ class SeededDataManager(DataManager):
         Number of voxels sampled per dataset; about four times as many voxels
         are read, in whole chunks.
     random_state : int, Generator or None
-        Seed for the voxel sample.
+        Seed for the voxel sample. It is turned into one fixed seed when the
+        manager is made, so every call (display and training) gives the same
+        seeds; each dataset gets its own stream from it by its position in
+        ``datasets``.
     """
 
     def __init__(
@@ -114,11 +118,14 @@ class SeededDataManager(DataManager):
         super().__init__(datasets)
         if background_label < 1:
             raise ValueError("background_label must be at least 1 (0 is unlabelled)")
+        if n_candidates < 1:
+            raise ValueError("n_candidates must be at least 1")
         self.background_label = background_label
         self.percentile = percentile
         self.max_seeds = max_seeds
         self.n_candidates = n_candidates
         self.random_state = random_state
+        self._seed = int(np.random.default_rng(random_state).integers(2**63))
 
     def get_training_data(self):
         """Painted rows of every dataset, then its background seeds."""
@@ -135,7 +142,11 @@ class SeededDataManager(DataManager):
 
     def seeds(self, dataset: DataSet):
         """Flat voxel indices (sorted) and (n, d) feature rows of the seeds."""
-        rng = np.random.default_rng(self.random_state)
+        position = next(
+            (i for i, d in enumerate(self.datasets) if d is dataset),
+            len(self.datasets),
+        )
+        rng = np.random.default_rng([position, self._seed])
         sample, rows, painted = _sample_voxels(
             dataset.concatenated_features, dataset.labels, self.n_candidates, rng
         )

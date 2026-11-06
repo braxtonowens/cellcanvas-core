@@ -1,6 +1,7 @@
 import dask.array as da
 import numpy as np
 import pytest
+import zarr
 from sklearn.tree import DecisionTreeClassifier
 
 from cellcanvas_core.data.data_manager import DataManager
@@ -83,6 +84,51 @@ def test_reproducible_and_validated():
         SeededDataManager([ds], background_label=0)
     with pytest.raises(TypeError):  # required: no default that could collide
         SeededDataManager([ds])
+    with pytest.raises(ValueError):
+        SeededDataManager([ds], background_label=1, n_candidates=0)
+
+
+@pytest.mark.parametrize("random_state", [None, np.random.default_rng(5)])
+def test_seeds_are_stable_across_calls(random_state):
+    """The seeds shown are the seeds trained on, also for a Generator or None."""
+    features, labels, _ = volume()
+    ds = dataset(features, labels)
+    manager = SeededDataManager(
+        [ds],
+        background_label=1,
+        n_candidates=300,
+        max_seeds=20,
+        random_state=random_state,
+    )
+    shown = manager.seed_indices(ds)
+    np.testing.assert_array_equal(manager.seed_indices(ds), shown)
+    X, _ = manager.get_training_data()
+    seed_rows = X.compute()[-len(shown) :]
+    np.testing.assert_array_equal(seed_rows, features.reshape(3, -1)[:, shown].T)
+
+
+def test_same_shaped_datasets_get_different_seeds():
+    features, labels, _ = volume()
+    first, second = dataset(features, labels), dataset(features, labels)
+    manager = SeededDataManager(
+        [first, second], background_label=1, n_candidates=300, max_seeds=20
+    )
+    assert not np.array_equal(manager.seed_indices(first), manager.seed_indices(second))
+
+
+def test_zarr_labels(tmp_path):
+    """Labels stored as a Zarr array are read lazily and give the same seeds."""
+    features, labels, _ = volume()
+    stored = zarr.create_array(
+        str(tmp_path / "labels.zarr"), shape=SHAPE, chunks=(1, 20, 20), dtype="i4"
+    )
+    stored[:] = labels
+    few = {"background_label": 1, "n_candidates": 300, "max_seeds": 20}
+    ds, ds_zarr = dataset(features, labels), dataset(features, stored)
+    np.testing.assert_array_equal(
+        SeededDataManager([ds], **few).seed_indices(ds),
+        SeededDataManager([ds_zarr], **few).seed_indices(ds_zarr),
+    )
 
 
 def test_seeds_keep_the_cube_from_flooding():
