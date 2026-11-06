@@ -85,8 +85,11 @@ class SeededDataManager(DataManager):
         As `DataManager`.
     background_label : int
         Stored label value of the background class (``>= 1``; 0 is
-        unlabelled). Seeds are returned as ``background_label - 1``, the
-        label space of `get_training_data`.
+        unlabelled), keyword-only and required. Seeds are returned as
+        ``background_label - 1``, the label space of `get_training_data`, so
+        they join any voxels painted with this value. Pick a value no other
+        class uses: if it is a foreground class's value, the seeds are trained
+        as that class.
     percentile : float
         Distance percentile below which a sampled voxel is a seed.
     max_seeds : int
@@ -101,7 +104,8 @@ class SeededDataManager(DataManager):
     def __init__(
         self,
         datasets=None,
-        background_label: int = 1,
+        *,
+        background_label: int,
         percentile: float = 10.0,
         max_seeds: int = 20000,
         n_candidates: int = 200000,

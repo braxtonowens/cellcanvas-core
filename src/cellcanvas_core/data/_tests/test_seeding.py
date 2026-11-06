@@ -35,7 +35,9 @@ def dataset(features, labels):
 
 def test_seeds_are_unlabelled_typical_voxels():
     features, labels, cube = volume()
-    manager = SeededDataManager([dataset(features, labels)], max_seeds=50)
+    manager = SeededDataManager(
+        [dataset(features, labels)], background_label=1, max_seeds=50
+    )
     idx = manager.seed_indices(manager.datasets[0])
     assert 0 < len(idx) <= 50
     assert np.all(labels.reshape(-1)[idx] == 0)
@@ -61,7 +63,7 @@ def test_training_data_appends_background_rows():
 def test_fully_labelled_dataset_adds_nothing():
     features, labels, _ = volume()
     ds = dataset(features, np.ones_like(labels))
-    manager = SeededDataManager([ds])
+    manager = SeededDataManager([ds], background_label=1)
     assert manager.seed_rows(ds) is None
     X, y = manager.get_training_data()
     assert X.shape[0] == labels.size and y.shape[0] == labels.size
@@ -70,7 +72,8 @@ def test_fully_labelled_dataset_adds_nothing():
 def test_reproducible_and_validated():
     features, labels, _ = volume()
     ds = dataset(features, labels)
-    few = {"n_candidates": 300, "max_seeds": 20}  # the sample must matter here
+    # the sample must matter here
+    few = {"background_label": 1, "n_candidates": 300, "max_seeds": 20}
     a = SeededDataManager([ds], random_state=3, **few).seed_indices(ds)
     b = SeededDataManager([ds], random_state=3, **few).seed_indices(ds)
     np.testing.assert_array_equal(a, b)
@@ -78,6 +81,8 @@ def test_reproducible_and_validated():
     assert not np.array_equal(a, c)
     with pytest.raises(ValueError):
         SeededDataManager([ds], background_label=0)
+    with pytest.raises(TypeError):  # required: no default that could collide
+        SeededDataManager([ds])
 
 
 def test_seeds_keep_the_cube_from_flooding():
@@ -117,7 +122,9 @@ def test_only_some_chunks_are_read():
     ds = DataSet(
         np.zeros((1, *SHAPE)), {"features": chunked}, labels, np.zeros_like(labels)
     )
-    idx = SeededDataManager([ds], n_candidates=50, max_seeds=10).seed_indices(ds)
+    idx = SeededDataManager(
+        [ds], background_label=1, n_candidates=50, max_seeds=10
+    ).seed_indices(ds)
     regions = {tuple((k.start, k.stop) for k in key[1:]) for key in recorder.reads}
     assert 0 < len(regions) < 16  # 50 voxels of 100-voxel chunks: two chunks read
     z, y, x = np.unravel_index(idx, SHAPE)
@@ -132,4 +139,4 @@ def test_non_finite_features_raise():
     features[:] = np.nan
     ds = dataset(features, labels)
     with pytest.raises(ValueError, match="NaN or infinite"):
-        SeededDataManager([ds]).get_training_data()
+        SeededDataManager([ds], background_label=1).get_training_data()
