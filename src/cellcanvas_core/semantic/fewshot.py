@@ -103,7 +103,7 @@ def _backend(device):
 
 
 class FewShotClassifier(ClassifierMixin, BaseEstimator):
-    """MLP and class-balanced kNN vote on frozen features, averaged.
+    """MLP and kNN vote on frozen features, averaged.
 
     Meant for a few painted voxels on features from a frozen, pretrained
     network. Features are used as given, without scaling; the kNN vote
@@ -115,8 +115,9 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
     (``Linear - GELU - Dropout - Linear``) is trained with class-weighted
     cross-entropy and AdamW for a fixed number of minibatch steps, so fitting
     does not slow down as more voxels are painted. The kNN vote compares each
-    row with a bank of painted rows (cosine similarity) and weights each vote
-    by the inverse of its class's share of the bank.
+    row with a bank of painted rows (cosine similarity); each of the most
+    similar rows casts one vote for its class (``balanced_vote`` weights it
+    instead by the inverse of its class's share of the bank).
 
     With PyTorch installed and a GPU available, fitting and prediction run on
     the GPU; otherwise they run on the CPU with NumPy. The kNN vote dominates
@@ -143,6 +144,11 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         painted rows in which every class keeps at least ``n_neighbors`` rows.
     knn_weight : float
         Weight of the kNN vote; the MLP gets ``1 - knn_weight``.
+    balanced_vote : bool
+        Weight each kNN vote by the inverse of its class's share of the bank,
+        so that rarely painted classes count as much as common ones. Off by
+        default: with sparse labels, where most paint is background, it
+        spreads rare classes onto nearby background.
     unlabelled : int or None
         Label of rows to ignore in `fit`. None uses every row.
     device : str
@@ -173,6 +179,7 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         n_neighbors: int = 16,
         max_bank_size: int = 20000,
         knn_weight: float = 0.5,
+        balanced_vote: bool = False,
         unlabelled: int | None = -1,
         device: str = "auto",
         random_state=0,
@@ -186,6 +193,7 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         self.n_neighbors = n_neighbors
         self.max_bank_size = max_bank_size
         self.knn_weight = knn_weight
+        self.balanced_vote = balanced_vote
         self.unlabelled = unlabelled
         self.device = device
         self.random_state = random_state
@@ -427,12 +435,15 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
             keep.sort()
             X, y = X[keep], y[keep]
             counts = quota
-        share = counts / counts.sum()
-        vote_weight = np.where(share > 0, 1.0 / np.maximum(share, 1e-12), 0.0)
+        if self.balanced_vote:
+            share = counts / counts.sum()
+            vote_weight = np.where(share > 0, 1.0 / np.maximum(share, 1e-12), 0.0)
+        else:
+            vote_weight = np.ones(n_classes)
         return _l2_normalize(X), y, vote_weight.astype(np.float32)
 
     def _knn_proba(self, X, bank, xp):
-        """Class-balanced vote of the most similar bank rows (cosine)."""
+        """Vote of the most similar bank rows (cosine), weighted by class."""
         rows, bank_y, vote_weight = bank
         k = min(self.n_neighbors, len(rows))
         top = xp.top_k(xp.normalize(X) @ rows.T, k)
