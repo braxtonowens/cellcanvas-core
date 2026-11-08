@@ -15,6 +15,10 @@ from sklearn.utils.validation import check_is_fitted, check_X_y
 # matrix allowed per block: 16 MB on the CPU, 128 MB on the GPU.
 _BLOCK_MAX = {"numpy": 8192, "torch": 16384}
 _BLOCK_CELLS = {"numpy": 4_000_000, "torch": 32_000_000}
+# Rows moved to the device, checked and predicted before results come back:
+# at most this many, and at most 256 MB of float32 features.
+_CHUNK_ROWS = {"numpy": 8192, "torch": 131072}
+_CHUNK_BYTES = 256 * 2**20
 
 
 def _l2_normalize(x):
@@ -38,8 +42,17 @@ class _NumPy:
     def put(self, a):
         return a
 
+    def put_float32(self, a):
+        return np.asarray(a, dtype=np.float32)
+
     def get(self, a):
         return a
+
+    def all_finite(self, a):
+        return bool(np.isfinite(a).all())
+
+    def concat(self, arrays):
+        return np.concatenate(arrays)
 
     def arange(self, n):
         return np.arange(n)
@@ -69,8 +82,21 @@ class _Torch:
     def put(self, a):
         return self.torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
 
+    def put_float32(self, a):
+        a = np.asarray(a)
+        if a.dtype not in (np.dtype("=f2"), np.dtype("=f4")):
+            a = a.astype(np.float32)
+        # float16 features cross at half size and are converted on the device.
+        return self.put(a).to(self.float32)
+
     def get(self, a):
         return a.cpu().numpy()
+
+    def all_finite(self, a):
+        return bool(self.torch.isfinite(a).all())
+
+    def concat(self, arrays):
+        return self.torch.cat(arrays)
 
     def arange(self, n):
         return self.torch.arange(n, device=self.device)
@@ -255,11 +281,12 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         X, xp, block = self._check_X(X)
         out = np.empty((len(X), len(self.classes_)), dtype=np.float32)
         if len(self.classes_) < 2:
+            if not np.isfinite(X).all():
+                raise ValueError("Features contain NaN or infinite values")
             out[:] = 1
             return out
-        for start in range(0, len(X), block):
-            p = self._proba(X[start : start + block], xp)
-            out[start : start + block] = xp.get(p)
+        for start, p in self._chunks(X, xp, block):
+            out[start : start + len(p)] = xp.get(p)
         return out
 
     def predict(self, X):
@@ -277,11 +304,12 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         """
         X, xp, block = self._check_X(X)
         if len(self.classes_) < 2:
+            if not np.isfinite(X).all():
+                raise ValueError("Features contain NaN or infinite values")
             return np.full(len(X), self.classes_[0])
         out = np.empty(len(X), dtype=self.classes_.dtype)
-        for start in range(0, len(X), block):
-            p = self._proba(X[start : start + block], xp)
-            out[start : start + block] = self.classes_[xp.get(p.argmax(axis=1))]
+        for start, p in self._chunks(X, xp, block):
+            out[start : start + len(p)] = self.classes_[xp.get(p.argmax(axis=1))]
         return out
 
     def __getstate__(self):
@@ -307,8 +335,6 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
             raise ValueError(
                 f"Expected X with shape (n, {self.n_features_in_}), got {X.shape}"
             )
-        if not np.isfinite(X).all():
-            raise ValueError("Features contain NaN or infinite values")
         if self.knn_weight < 1 and self.mlp_ is None and len(self.classes_) > 1:
             raise ValueError("knn_weight was 1 at fit time; call fit again")
         if self.knn_weight > 0 and self.bank_ is None and len(self.classes_) > 1:
@@ -334,9 +360,25 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
             self._on_device = cache = (key, mlp, bank)
         return cache[1:]
 
+    def _chunks(self, X, xp, block):
+        """(first row, probabilities as an array of ``xp``) per chunk of X.
+
+        Each chunk is moved to the device and checked once, then predicted
+        block by block there; only its probabilities come back.
+        """
+        size = min(_CHUNK_ROWS[xp.name], _CHUNK_BYTES // (4 * X.shape[1]))
+        size = max(block, size)
+        for start in range(0, len(X), size):
+            rows = xp.put_float32(X[start : start + size])
+            if not xp.all_finite(rows):
+                raise ValueError("Features contain NaN or infinite values")
+            parts = [
+                self._proba(rows[i : i + block], xp) for i in range(0, len(rows), block)
+            ]
+            yield start, parts[0] if len(parts) == 1 else xp.concat(parts)
+
     def _proba(self, X, xp):
-        """Probabilities for one block of rows, as an array of ``xp``."""
-        X = xp.put(np.asarray(X, dtype=np.float32))
+        """Probabilities for one block of float32 rows of ``xp``."""
         mlp, bank = self._fitted(xp)
         if self.knn_weight == 1:
             return self._knn_proba(X, bank, xp)

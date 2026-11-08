@@ -272,3 +272,15 @@ def test_device_without_torch(monkeypatch):
     with pytest.raises(ImportError, match="PyTorch"):
         model.set_params(device="cuda").fit(X, y)
     assert np.mean(model.set_params(device="numpy").predict(X) == y) > 0.95
+
+
+@pytest.mark.parametrize("dtype", ["<f8", ">f4", "<f2", "<i4"])
+def test_feature_dtypes_predict_alike(dtype):
+    X, y = blobs(30)
+    model = FewShotClassifier(**FAST).fit(X, y)
+    expected = model.predict_proba(X.astype(np.float32))
+    np.testing.assert_allclose(
+        model.predict_proba(X.astype(dtype)),
+        expected,
+        atol=2e-3 if dtype == "<f2" else 1e-3,
+    )

@@ -1,4 +1,5 @@
 from typing import Protocol
+from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 
 import sys
@@ -144,11 +145,16 @@ class SemanticSegmentationManager:
     def predict_to_segmentation(self, dataset: DataSet, batch_size=65536):
         """Write positive class labels to the dataset in spatial blocks.
 
-        Model calls contain at most batch_size voxels. Memory includes the
-        feature block, its source chunks and one block of predictions; no
-        complete prediction volume is allocated. Model classes start at zero
-        and are shifted by one for storage. Existing painting labels are left
-        intact. A failure can leave already written blocks in place.
+        Model calls and writes contain at most batch_size voxels. Features are
+        read in blocks that follow their dask chunks when a chunk is at most
+        256 MiB (otherwise in blocks of about batch_size voxels), so feature
+        arrays that share storage chunks have every chunk read once; the next
+        block is read while the current one is predicted. Memory includes two
+        feature blocks, their source chunks and batch_size predictions; no
+        complete prediction volume is allocated.
+        Model classes start at zero and are shifted by one for storage.
+        Existing painting labels are left intact. A failure can leave already
+        written blocks in place.
         """
         if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
@@ -159,24 +165,68 @@ class SemanticSegmentationManager:
         features = dataset.concatenated_features
         if features.shape[1:] != target.shape:
             raise ValueError("Feature spatial axes must match segmentation storage")
-        z, y, x = target.shape
+        blocks = self._read_blocks(features, batch_size)
+        if not blocks:
+            return
+        read = lambda region: features[(slice(None), *region)].compute()  # noqa: E731
+        with ThreadPoolExecutor(max_workers=1) as reader:
+            pending = reader.submit(read, blocks[0])
+            for i, outer in enumerate(blocks):
+                block = pending.result()
+                if i + 1 < len(blocks):
+                    pending = reader.submit(read, blocks[i + 1])
+                for inner in self._tiles(block.shape[1:], batch_size):
+                    part = block[(slice(None), *inner)]
+                    rows = np.moveaxis(part, 0, -1).reshape(-1, part.shape[0])
+                    classes = np.asarray(self.model.predict(rows))
+                    if classes.shape != (len(rows),):
+                        raise ValueError(
+                            "Model must return one class per feature row"
+                        )
+                    if classes.dtype.kind not in "iu" or np.any(classes < 0):
+                        raise ValueError(
+                            "Model classes must be nonnegative integers"
+                        )
+                    if np.any(classes > np.iinfo(dtype).max - 1):
+                        raise ValueError(
+                            "Model classes do not fit in segmentation storage "
+                            "after adding one"
+                        )
+                    region = tuple(
+                        slice(o.start + n.start, o.start + n.stop)
+                        for o, n in zip(outer, inner, strict=True)
+                    )
+                    stored = classes.astype(dtype) + 1
+                    target[region] = stored.reshape(part.shape[1:])
+
+    @classmethod
+    def _read_blocks(cls, features, batch_size, max_bytes=256 * 2**20):
+        """Spatial blocks of (c, z, y, x) features to read: chunks if small enough."""
+        chunks = features.chunks[1:]
+        voxels = max(a * b * d for a, b, d in product(*chunks))
+        if voxels * features.shape[0] * features.dtype.itemsize > max_bytes:
+            return cls._tiles(features.shape[1:], batch_size)
+        edges = [np.cumsum((0, *c)) for c in chunks]
+        return [
+            tuple(
+                slice(int(e[i]), int(e[i + 1]))
+                for e, i in zip(edges, index, strict=True)
+            )
+            for index in product(*(range(len(c)) for c in chunks))
+        ]
+
+    @staticmethod
+    def _tiles(shape, batch_size):
+        """(z, y, x) blocks of shape holding at most batch_size voxels, row-major."""
+        z, y, x = shape
         block_x = min(x, batch_size)
         block_y = min(y, max(1, batch_size // block_x))
         block_z = min(z, max(1, batch_size // (block_x * block_y)))
-        for start_z, start_y, start_x in product(
-            range(0, z, block_z), range(0, y, block_y), range(0, x, block_x)
-        ):
-            region = (slice(start_z, min(z, start_z + block_z)),
-                      slice(start_y, min(y, start_y + block_y)),
-                      slice(start_x, min(x, start_x + block_x)))
-            block = features[(slice(None),) + region].compute()
-            rows = np.moveaxis(block, 0, -1).reshape(-1, block.shape[0])
-            classes = np.asarray(self.model.predict(rows))
-            if classes.shape != (len(rows),):
-                raise ValueError("Model must return one class per feature row")
-            if classes.dtype.kind not in "iu" or np.any(classes < 0):
-                raise ValueError("Model classes must be nonnegative integers")
-            if np.any(classes > np.iinfo(dtype).max - 1):
-                raise ValueError("Model classes do not fit in segmentation storage after adding one")
-            stored = classes.astype(dtype) + 1
-            target[region] = stored.reshape(block.shape[1:])
+        return [
+            (slice(start_z, min(z, start_z + block_z)),
+             slice(start_y, min(y, start_y + block_y)),
+             slice(start_x, min(x, start_x + block_x)))
+            for start_z, start_y, start_x in product(
+                range(0, z, block_z), range(0, y, block_y), range(0, x, block_x)
+            )
+        ]

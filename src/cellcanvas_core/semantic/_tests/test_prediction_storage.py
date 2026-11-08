@@ -1,5 +1,6 @@
 from unittest.mock import Mock
 
+import dask.array as da
 import numpy as np
 import pytest
 import zarr
@@ -122,3 +123,44 @@ def test_untrained_model_does_not_write():
     with pytest.raises(NotFittedError):
         manager.predict_to_segmentation(dataset, batch_size=2)
     np.testing.assert_array_equal(dataset.segmentation, 0)
+
+
+class ReadRecorder:
+    """An array that records which regions are read."""
+
+    def __init__(self, values):
+        self.values, self.reads = values, []
+        self.shape, self.dtype, self.ndim = values.shape, values.dtype, values.ndim
+
+    def __getitem__(self, key):
+        self.reads.append(tuple((k.start, k.stop) for k in key[1:]))
+        return self.values[key]
+
+
+def test_prediction_reads_each_feature_chunk_once():
+    shape = (4, 3, 7)
+    indices = np.arange(np.prod(shape)).reshape(shape)
+    recorder = ReadRecorder(np.stack([indices % 2, indices % 3]).astype("f4"))
+    features = da.from_array(recorder, chunks=(2, 2, 3, 4), asarray=True)  # 4 chunks
+    painting = (indices % 2 + 1).astype("u1")
+    target = np.zeros(shape, dtype="u1")
+    dataset = DataSet(np.zeros((1, *shape)), {"features": features}, painting, target)
+    manager = SemanticSegmentationManager(
+        DataManager([dataset]), DecisionTreeClassifier(random_state=0)
+    )
+    manager.fit()
+    recorder.reads.clear()
+    manager.predict_to_segmentation(dataset, batch_size=5)
+    assert sorted(recorder.reads) == sorted(set(recorder.reads))  # no chunk twice
+    assert len(recorder.reads) == 4
+    np.testing.assert_array_equal(target, painting)
+
+
+def test_prediction_blocks_fall_back_to_batches_for_large_chunks():
+    features = da.zeros((3, 4, 3, 7), chunks=(3, 4, 3, 7))
+    blocks = SemanticSegmentationManager._read_blocks(features, 5, max_bytes=1)
+    assert all(np.prod([s.stop - s.start for s in block]) <= 5 for block in blocks)
+    covered = np.zeros((4, 3, 7), dtype=int)
+    for block in blocks:
+        covered[block] += 1
+    assert (covered == 1).all()
