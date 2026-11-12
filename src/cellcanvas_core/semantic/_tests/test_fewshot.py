@@ -57,6 +57,29 @@ def test_rare_class_is_not_swamped():
     assert np.mean(rare == 1) > 0.95
 
 
+def test_vote_counts_neighbours_unless_balanced():
+    # A query at angle 0 has 12 class-0 and 4 class-1 rows as its 16 nearest
+    # neighbours; 100 more class-0 rows point the other way and only make
+    # class 0 common in the bank.
+    def at(angles):
+        return np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
+
+    near0, near1 = at(np.linspace(0.01, 0.12, 12)), at(np.linspace(0.2, 0.23, 4))
+    X = np.concatenate([near0, near1, at(np.full(100, np.pi))])
+    y = np.repeat([0, 1, 0], [12, 4, 100])
+    query = at(np.zeros(1))
+    plain = FewShotClassifier(knn_weight=1.0, **FAST).fit(X, y)
+    np.testing.assert_array_equal(plain.bank_[2], [1, 1])
+    np.testing.assert_allclose(plain.predict_proba(query), [[0.75, 0.25]], rtol=1e-5)
+    balanced = clone(plain).set_params(balanced_vote=True).fit(X, y)
+    weight = np.array([116 / 112, 116 / 4])  # inverse class shares
+    np.testing.assert_allclose(balanced.bank_[2], weight, rtol=1e-5)
+    votes = np.array([12, 4]) * weight
+    np.testing.assert_allclose(
+        balanced.predict_proba(query), [votes / votes.sum()], rtol=1e-5
+    )
+
+
 def test_unlabelled_rows_are_ignored():
     X, y = blobs(20, n_classes=2)
     noise = np.random.default_rng(3).normal(size=(200, X.shape[1]))
