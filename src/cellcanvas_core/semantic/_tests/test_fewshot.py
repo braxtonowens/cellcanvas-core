@@ -204,6 +204,36 @@ def test_predict_matches_predict_proba():
     )
 
 
+@pytest.mark.parametrize("device", ["numpy", "cpu", "cuda"])
+def test_transfer_chunks_keep_the_byte_cap_for_wide_features(monkeypatch, device):
+    # Wide rows and a large inference block, as with many feature channels on
+    # the GPU: each array moved to the device stays within _CHUNK_BYTES.
+    import cellcanvas_core.semantic.fewshot as fewshot
+
+    if device != "numpy":
+        torch = pytest.importorskip("torch")
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("no CUDA device")
+    backend = fewshot._NumPy if device == "numpy" else fewshot._Torch
+    X, y = blobs(30, dim=64)
+    model = FewShotClassifier(device=device, **FAST).fit(X, y)
+    expected = model.predict_proba(X)
+    cap = 4 * 64 * 7  # seven rows
+    monkeypatch.setattr(fewshot, "_CHUNK_BYTES", cap)
+    monkeypatch.setitem(fewshot._BLOCK_MAX, backend.name, 64)
+    sent = []
+    put = backend.put_float32
+    monkeypatch.setattr(
+        backend, "put_float32", lambda self, a: sent.append(a.nbytes) or put(self, a)
+    )
+    np.testing.assert_allclose(model.predict_proba(X), expected, rtol=1e-5, atol=1e-6)
+    assert sent and max(sent) <= cap
+    assert sum(sent) == X.nbytes
+    sent.clear()
+    np.testing.assert_array_equal(model.predict(X), expected.argmax(axis=1))
+    assert max(sent) <= cap
+
+
 def test_random_state_makes_fits_repeatable():
     X, y = blobs(30)
     a = FewShotClassifier(**FAST).fit(X, y).predict_proba(X)

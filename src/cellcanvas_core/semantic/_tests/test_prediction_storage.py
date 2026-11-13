@@ -158,9 +158,32 @@ def test_prediction_reads_each_feature_chunk_once():
 
 def test_prediction_blocks_fall_back_to_batches_for_large_chunks():
     features = da.zeros((3, 4, 3, 7), chunks=(3, 4, 3, 7))
-    blocks = SemanticSegmentationManager._read_blocks(features, 5, max_bytes=1)
+    blocks = list(SemanticSegmentationManager._read_blocks(features, 5, max_bytes=1))
     assert all(np.prod([s.stop - s.start for s in block]) <= 5 for block in blocks)
     covered = np.zeros((4, 3, 7), dtype=int)
     for block in blocks:
         covered[block] += 1
     assert (covered == 1).all()
+
+
+def test_prediction_blocks_are_planned_lazily():
+    # metadata only: a 512^3 grid of 8^3 chunks has 262,144 regions
+    import tracemalloc
+    from types import SimpleNamespace
+
+    grid = ((8,) * 64,) * 3
+    features = SimpleNamespace(
+        shape=(2, 512, 512, 512), chunks=((2,), *grid), dtype=np.dtype("f4")
+    )
+    plan = SemanticSegmentationManager._read_blocks
+    tracemalloc.start()
+    try:
+        chunk_blocks = plan(features, 512)
+        first = [next(chunk_blocks) for _ in range(3)]
+        next(plan(features, 512, max_bytes=1))  # the batch_size tiles
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2**20
+    assert first[0] == (slice(0, 8), slice(0, 8), slice(0, 8))
+    assert first[2] == (slice(0, 8), slice(0, 8), slice(16, 24))

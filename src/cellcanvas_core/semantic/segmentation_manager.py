@@ -166,15 +166,17 @@ class SemanticSegmentationManager:
         if features.shape[1:] != target.shape:
             raise ValueError("Feature spatial axes must match segmentation storage")
         blocks = self._read_blocks(features, batch_size)
-        if not blocks:
+        outer = next(blocks, None)
+        if outer is None:
             return
         read = lambda region: features[(slice(None), *region)].compute()  # noqa: E731
         with ThreadPoolExecutor(max_workers=1) as reader:
-            pending = reader.submit(read, blocks[0])
-            for i, outer in enumerate(blocks):
+            pending = reader.submit(read, outer)
+            while outer is not None:
                 block = pending.result()
-                if i + 1 < len(blocks):
-                    pending = reader.submit(read, blocks[i + 1])
+                following = next(blocks, None)  # plan one region ahead only
+                if following is not None:
+                    pending = reader.submit(read, following)
                 for inner in self._tiles(block.shape[1:], batch_size):
                     part = block[(slice(None), *inner)]
                     rows = np.moveaxis(part, 0, -1).reshape(-1, part.shape[0])
@@ -198,35 +200,42 @@ class SemanticSegmentationManager:
                     )
                     stored = classes.astype(dtype) + 1
                     target[region] = stored.reshape(part.shape[1:])
+                outer = following
 
     @classmethod
     def _read_blocks(cls, features, batch_size, max_bytes=256 * 2**20):
-        """Spatial blocks of (c, z, y, x) features to read: chunks if small enough."""
+        """Spatial blocks of (c, z, y, x) features to read: chunks if small enough.
+
+        An iterator: blocks are made as they are read, not planned up front.
+        """
         chunks = features.chunks[1:]
-        voxels = max(a * b * d for a, b, d in product(*chunks))
+        voxels = int(np.prod([max(c) for c in chunks]))  # bounds the largest chunk
         if voxels * features.shape[0] * features.dtype.itemsize > max_bytes:
             return cls._tiles(features.shape[1:], batch_size)
         edges = [np.cumsum((0, *c)) for c in chunks]
-        return [
+        return (
             tuple(
                 slice(int(e[i]), int(e[i + 1]))
                 for e, i in zip(edges, index, strict=True)
             )
             for index in product(*(range(len(c)) for c in chunks))
-        ]
+        )
 
     @staticmethod
     def _tiles(shape, batch_size):
-        """(z, y, x) blocks of shape holding at most batch_size voxels, row-major."""
+        """(z, y, x) blocks of shape holding at most batch_size voxels, row-major.
+
+        An iterator, so large volumes are not planned up front.
+        """
         z, y, x = shape
         block_x = min(x, batch_size)
         block_y = min(y, max(1, batch_size // block_x))
         block_z = min(z, max(1, batch_size // (block_x * block_y)))
-        return [
+        return (
             (slice(start_z, min(z, start_z + block_z)),
              slice(start_y, min(y, start_y + block_y)),
              slice(start_x, min(x, start_x + block_x)))
             for start_z, start_y, start_x in product(
                 range(0, z, block_z), range(0, y, block_y), range(0, x, block_x)
             )
-        ]
+        )

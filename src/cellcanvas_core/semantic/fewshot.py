@@ -366,8 +366,9 @@ class FewShotClassifier(ClassifierMixin, BaseEstimator):
         Each chunk is moved to the device and checked once, then predicted
         block by block there; only its probabilities come back.
         """
-        size = min(_CHUNK_ROWS[xp.name], _CHUNK_BYTES // (4 * X.shape[1]))
-        size = max(block, size)
+        # The byte cap wins over the block: wide rows give chunks below one
+        # block, each predicted as a single (smaller) block.
+        size = max(1, min(_CHUNK_ROWS[xp.name], _CHUNK_BYTES // (4 * X.shape[1])))
         for start in range(0, len(X), size):
             rows = xp.put_float32(X[start : start + size])
             if not xp.all_finite(rows):
