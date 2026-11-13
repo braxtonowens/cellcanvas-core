@@ -41,10 +41,27 @@ class Route:
             np.ndim(c) != 1 or len(c) != 2 for c in self.columns
         ):
             raise TypeError("Route columns must be a sequence of (start, stop) pairs")
-        object.__setattr__(self, "classes", tuple(int(c) for c in self.classes))
         object.__setattr__(
-            self, "columns", tuple((int(a), int(b)) for a, b in self.columns)
+            self, "classes", tuple(_whole(c, "classes") for c in self.classes)
         )
+        object.__setattr__(
+            self,
+            "columns",
+            tuple(
+                (_whole(a, "columns"), _whole(b, "columns")) for a, b in self.columns
+            ),
+        )
+
+
+def _whole(value, what):
+    """``value`` as an int; reject fractions and non-numbers instead of truncating."""
+    if isinstance(value, bool | np.bool_) or not isinstance(
+        value, int | float | np.integer | np.floating
+    ):
+        raise TypeError(f"Route {what} must be integers, got {value!r}")
+    if value != int(value):
+        raise ValueError(f"Route {what} must be whole numbers, got {value!r}")
+    return int(value)
 
 
 class _OneClass:

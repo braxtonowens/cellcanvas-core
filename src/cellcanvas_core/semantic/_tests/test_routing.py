@@ -416,6 +416,23 @@ def test_route_arguments_are_checked():
     assert Route([2, 3], [[0, 4]]) == Route((2, 3), ((0, 4),))
 
 
+def test_fractional_route_values_are_rejected():
+    # truncating would silently change the class or the columns of the route
+    with pytest.raises(ValueError, match="whole numbers"):
+        Route((2.9,), ((0, 4),))
+    with pytest.raises(ValueError, match="whole numbers"):
+        Route((2,), ((0.9, 1.9),))
+    with pytest.raises(TypeError, match="integers"):
+        Route(("2",), ((0, 4),))
+    with pytest.raises(TypeError, match="integers"):
+        Route((True,), ((0, 4),))
+    exact = Route((np.int64(2), 3.0), ((np.uint8(0), np.float32(4.0)),))
+    assert exact == Route((2, 3), ((0, 4),))
+    assert all(
+        isinstance(c, int) and not isinstance(c, np.integer) for c in exact.classes
+    )
+
+
 def test_classes_of_a_route_in_any_order():
     rng = np.random.default_rng(9)
     X = rng.normal(size=(60, 6)).astype(np.float32)
